@@ -5,7 +5,7 @@ from pathlib import Path
 from src.pipeline import PenaltyPipeline
 
 
-DEFAULT_INPUT = Path("data/penalties_mbappe_2.mp4")
+DEFAULT_INPUT = Path("data/penalties_mbappe_1.mp4")
 DEFAULT_OUTPUT_DIR = Path("data/cv_output")
 INPUT_VIDEO = DEFAULT_INPUT
 OUTPUT_VIDEO = None

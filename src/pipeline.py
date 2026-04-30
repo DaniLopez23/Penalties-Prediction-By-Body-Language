@@ -9,7 +9,7 @@ from utils.drawings import draw_metrics_text, draw_pose, draw_role_detections, d
 
 from .video_io import VideoReader, VideoWriter
 from .detectors.ball_detector import BallDetector
-from .detectors.players_detector import PlayersDetector
+from .detectors.players_detector import PlayersDetector, PlayerDetection
 from .detectors.goal_detector import GoalDetector
 from .pose.pose_estimator import PoseEstimator
 from .penalty_metrics import MetricsCalculator, PenaltyMetrics
@@ -57,6 +57,16 @@ class PenaltyPipeline:
         self.last_goalkeeper = None
         self.last_shooter_pose = None
         self.last_goalkeeper_pose = None
+        self.role_track_max_dist = 160.0
+        self.role_hold_frames = 6
+        self.shooter_missing_frames = 0
+        self.goalkeeper_missing_frames = 0
+        # Hysteresis / confirmation to avoid rapid role switching
+        self.pending_shooter: Optional[PlayerDetection] = None
+        self.pending_goalkeeper: Optional[PlayerDetection] = None
+        self.shooter_confirm = 0
+        self.goalkeeper_confirm = 0
+        self.confirm_threshold = 2
     
     def process_video(
         self,
@@ -95,6 +105,9 @@ class PenaltyPipeline:
         frame_count = 0
         
         for frame_idx, frame in video_reader:
+            # Always start with a copy of the frame for display/writing
+            annotated = frame.copy()
+            
             # Skip frames based on process_every_n_frames
             should_process = (frame_idx % self.process_every_n_frames) == 0
             
@@ -105,7 +118,7 @@ class PenaltyPipeline:
                 goal = self.goal_detector.detect(frame)
                 
                 # Identify roles (shooter vs goalkeeper)
-                shooter, goalkeeper = self._identify_roles(players, goal)
+                shooter, goalkeeper = self._identify_roles(players, goal, frame.shape)
                 
                 # Estimate poses
                 shooter_pose = None
@@ -135,6 +148,7 @@ class PenaltyPipeline:
             
                 # Draw annotations
                 annotated = self._draw_annotations(frame, frame_idx)
+            
             video_writer.write(annotated)
             
             if show_preview:
@@ -157,43 +171,173 @@ class PenaltyPipeline:
         
         return Path(output_video)
     
-    def _identify_roles(self, players, goal):
-        """Identify shooter and goalkeeper from detected players.
-        
-        Simple heuristic: the player closest to goal = goalkeeper.
-        Assumes goal_x is available from goal detection.
-        
-        Args:
-            players: List of PlayerDetection objects.
-            goal: GoalDetection object or None.
-            
-        Returns:
-            Tuple of (shooter, goalkeeper) PlayerDetection or None.
-        """
+
+    def _identify_roles(
+        self,
+        players: list[PlayerDetection],
+        goal,
+        frame_shape: tuple[int, int, int],
+    ):
+        """Identify shooter and goalkeeper with simple spatial heuristics + temporal tracking."""
         if not players:
-            return None, None
-        
-        # Determine goal x-coordinate
-        if goal:
-            goal_x = (goal.bbox_xyxy[0] + goal.bbox_xyxy[2]) / 2
+            return (
+                self._track_player("shooter", None, []),
+                self._track_player("goalkeeper", None, []),
+            )
+
+        h, w = frame_shape[:2]
+        goal_center = None
+        goal_bbox = None
+        if goal is not None:
+            goal_bbox = goal.bbox_xyxy
+            gx1, gy1, gx2, gy2 = goal_bbox
+            goal_center = ((gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0)
+
+        goalkeeper_candidate = None
+        if goal_center is not None:
+            goalkeeper_candidate = min(
+                players,
+                key=lambda p: self._distance(p.center, goal_center) + max(0.0, p.center[1] - goal_center[1]) * 0.6,
+            )
         else:
-            # Fallback: assume goal is at rightmost x
-            goal_x = max(p.center[0] for p in players)
-        
-        # Sort by distance to goal
-        sorted_players = sorted(
-            players,
-            key=lambda p: abs(p.center[0] - goal_x)
-        )
-        
-        if len(sorted_players) >= 2:
-            # Closer to goal = goalkeeper
-            return sorted_players[1], sorted_players[0]
-        elif len(sorted_players) == 1:
-            # Only one player detected
-            return None, sorted_players[0]
-        
-        return None, None
+            # Fallback when goal is missing: goalkeeper is typically higher (farther) in the frame.
+            goalkeeper_candidate = min(players, key=lambda p: p.center[1])
+
+        remaining_players = [p for p in players if p is not goalkeeper_candidate]
+
+        shooter_candidate = None
+        if remaining_players:
+            shooter_candidate = max(
+                remaining_players,
+                key=lambda p: p.center[1] - 140.0 * self._goal_overlap_ratio(p, goal_bbox),
+            )
+        elif players:
+            # One-player fallback: treat lower player as shooter.
+            shooter_candidate = max(players, key=lambda p: p.center[1])
+
+        tracked_goalkeeper = self._track_player("goalkeeper", goalkeeper_candidate, players)
+        shooter_pool = [p for p in players if not self._same_detection(p, tracked_goalkeeper)]
+        tracked_shooter = self._track_player("shooter", shooter_candidate, shooter_pool)
+
+        # Last safety net in sparse/noisy frames.
+        if tracked_shooter is None and shooter_pool:
+            tracked_shooter = max(shooter_pool, key=lambda p: p.center[1])
+        if tracked_goalkeeper is None and players:
+            tracked_goalkeeper = min(players, key=lambda p: p.center[1])
+
+        if tracked_shooter is not None and tracked_goalkeeper is not None and self._same_detection(tracked_shooter, tracked_goalkeeper):
+            alternate = [p for p in players if not self._same_detection(p, tracked_goalkeeper)]
+            if alternate:
+                tracked_shooter = max(alternate, key=lambda p: p.center[1])
+
+        return tracked_shooter, tracked_goalkeeper
+
+    def _track_player(self, role: str, candidate: Optional[PlayerDetection], players: list[PlayerDetection]):
+        """Nearest-neighbor temporal tracking for one role (shooter or goalkeeper)."""
+        prev = self.last_shooter if role == "shooter" else self.last_goalkeeper
+        missing = self.shooter_missing_frames if role == "shooter" else self.goalkeeper_missing_frames
+
+        # If we have a previous and current detections, prefer the one closest to previous.
+        if prev is not None and players:
+            nearest = min(players, key=lambda p: self._distance(p.center, prev.center))
+            d_nearest = self._distance(nearest.center, prev.center)
+
+            # If it's essentially the same (very close), accept immediately.
+            if d_nearest < 40.0:
+                if role == "shooter":
+                    self.shooter_missing_frames = 0
+                    self.pending_shooter = None
+                    self.shooter_confirm = 0
+                else:
+                    self.goalkeeper_missing_frames = 0
+                    self.pending_goalkeeper = None
+                    self.goalkeeper_confirm = 0
+                return nearest
+
+            # If within tracking distance but different, require confirmation across frames.
+            if d_nearest <= self.role_track_max_dist:
+                if role == "shooter":
+                    if self.pending_shooter is None or not self._same_detection(self.pending_shooter, nearest):
+                        self.pending_shooter = nearest
+                        self.shooter_confirm = 1
+                    else:
+                        self.shooter_confirm += 1
+
+                    if self.shooter_confirm >= self.confirm_threshold:
+                        self.pending_shooter = None
+                        self.shooter_confirm = 0
+                        self.shooter_missing_frames = 0
+                        return nearest
+                    # wait for confirmation, keep prev for now
+                    return prev
+                else:
+                    if self.pending_goalkeeper is None or not self._same_detection(self.pending_goalkeeper, nearest):
+                        self.pending_goalkeeper = nearest
+                        self.goalkeeper_confirm = 1
+                    else:
+                        self.goalkeeper_confirm += 1
+
+                    if self.goalkeeper_confirm >= self.confirm_threshold:
+                        self.pending_goalkeeper = None
+                        self.goalkeeper_confirm = 0
+                        self.goalkeeper_missing_frames = 0
+                        return nearest
+                    return prev
+
+        # If no prev but we have a candidate from heuristics, accept it.
+        if prev is None and candidate is not None:
+            if role == "shooter":
+                self.shooter_missing_frames = 0
+            else:
+                self.goalkeeper_missing_frames = 0
+            return candidate
+
+        # If previous exists and short disappearance, hold previous
+        if prev is not None and missing < self.role_hold_frames:
+            if role == "shooter":
+                self.shooter_missing_frames += 1
+            else:
+                self.goalkeeper_missing_frames += 1
+            return prev
+
+        # Reset and give up
+        if role == "shooter":
+            self.shooter_missing_frames = 0
+            self.pending_shooter = None
+            self.shooter_confirm = 0
+        else:
+            self.goalkeeper_missing_frames = 0
+            self.pending_goalkeeper = None
+            self.goalkeeper_confirm = 0
+        return None
+
+    def _goal_overlap_ratio(self, player: PlayerDetection, goal_bbox) -> float:
+        if goal_bbox is None:
+            return 0.0
+
+        px1, py1, px2, py2 = player.bbox_xyxy
+        gx1, gy1, gx2, gy2 = goal_bbox
+        ix1 = max(px1, gx1)
+        iy1 = max(py1, gy1)
+        ix2 = min(px2, gx2)
+        iy2 = min(py2, gy2)
+
+        if ix2 <= ix1 or iy2 <= iy1:
+            return 0.0
+
+        inter_area = float((ix2 - ix1) * (iy2 - iy1))
+        player_area = max(1.0, float((px2 - px1) * (py2 - py1)))
+        return inter_area / player_area
+
+    def _distance(self, a: tuple[float, float], b: tuple[float, float]) -> float:
+        dx = a[0] - b[0]
+        dy = a[1] - b[1]
+        return float(np.sqrt(dx * dx + dy * dy))
+
+    def _same_detection(self, a: Optional[PlayerDetection], b: Optional[PlayerDetection]) -> bool:
+        if a is None or b is None:
+            return False
+        return a.bbox_xyxy == b.bbox_xyxy
     
     def _draw_annotations(self, frame: np.ndarray, frame_idx: int) -> np.ndarray:
         """Draw detections and metrics on frame.
