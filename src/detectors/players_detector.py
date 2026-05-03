@@ -4,6 +4,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List
 from ultralytics import YOLO
+from ..models import ModelConfig
 
 
 @dataclass
@@ -12,6 +13,7 @@ class PlayerDetection:
     bbox_xyxy: tuple[int, int, int, int]
     confidence: float
     center: tuple[float, float]
+    track_id: int | None = None  # Ultralytics ByteTrack ID
     
     @property
     def area(self) -> float:
@@ -23,14 +25,24 @@ class PlayerDetection:
 class PlayersDetector:
     """Detect players in soccer/penalty scenes using YOLO."""
     
-    def __init__(self, model_path: str = "yolov8s.pt", confidence: float = 0.25):
+    def __init__(
+        self,
+        model_path: str | None = None,
+        confidence: float | None = None,
+    ):
         """Initialize players detector.
         
         Args:
-            model_path: Path to YOLO model weights.
-            confidence: Confidence threshold for detections (default 0.25 - permissive).
+            model_path: Path to YOLO model weights. If None, uses ModelConfig.PLAYERS_MODEL.
+            confidence: Confidence threshold. If None, uses ModelConfig.PLAYERS_CONFIDENCE.
         """
+        if model_path is None:
+            model_path = ModelConfig.get_players_model_path()
+        if confidence is None:
+            confidence = ModelConfig.PLAYERS_CONFIDENCE
+            
         self.model = YOLO(model_path)
+        self.model_path = model_path
         self.confidence = confidence
         # Fixed-camera penalty setup: keep only plausible field players.
         self.central_x_min = 0.15
@@ -39,7 +51,7 @@ class PlayersDetector:
         self.min_area_ratio = 0.001
     
     def detect(self, frame: np.ndarray) -> List[PlayerDetection]:
-        """Detect all players in frame.
+        """Detect all players in frame using ByteTrack.
         
         Args:
             frame: Input frame as BGR numpy array.
@@ -47,8 +59,12 @@ class PlayersDetector:
         Returns:
             List of PlayerDetection objects (empty list if no players detected).
         """
-        results = self.model.predict(
+        # Use track() with ByteTrack for native tracking
+        results = self.model.track(
             frame,
+            imgsz=1280,
+            persist=True,
+            tracker='bytetrack.yaml',
             conf=self.confidence,
             classes=[0],  # COCO class for person
             verbose=False
@@ -73,10 +89,16 @@ class PlayersDetector:
             if not self._position_ok((x1, y1, x2, y2), center, frame_shape):
                 continue
             
+            # Extract track ID if available (None if tracking not active yet)
+            track_id: int | None = None
+            if boxes.id is not None:
+                track_id = int(boxes.id[i].item())
+            
             detections.append(PlayerDetection(
                 bbox_xyxy=(int(x1), int(y1), int(x2), int(y2)),
                 confidence=conf,
-                center=center
+                center=center,
+                track_id=track_id
             ))
         
         return detections

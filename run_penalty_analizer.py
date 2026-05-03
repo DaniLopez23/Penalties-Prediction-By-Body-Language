@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.pipeline import PenaltyPipeline
+from src.models import ModelConfig
 
 
 DEFAULT_INPUT = Path("data/penalties_mbappe_1.mp4")
@@ -11,13 +12,6 @@ INPUT_VIDEO = DEFAULT_INPUT
 OUTPUT_VIDEO = None
 SHOW_WINDOW = True
 MAX_FRAMES = None
-PROCESS_EVERY_N_FRAMES = 2
-BALL_MODEL = "yolov8s.pt"
-PLAYERS_MODEL = None
-POSE_MODEL = "yolov8s-pose.pt"
-BALL_CONFIDENCE = 0.2
-PLAYERS_CONFIDENCE = 0.25
-POSE_CONFIDENCE = 0.25
 
 
 def main() -> None:
@@ -30,15 +24,22 @@ def main() -> None:
 		DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 		output_path = DEFAULT_OUTPUT_DIR / f"annotated_{input_video.stem}.mp4"
 
-	pipeline = PenaltyPipeline(
-		ball_model=BALL_MODEL,
-		players_model=PLAYERS_MODEL,
-		pose_model=POSE_MODEL,
-		ball_confidence=BALL_CONFIDENCE,
-		players_confidence=PLAYERS_CONFIDENCE,
-		pose_confidence=POSE_CONFIDENCE,
-		process_every_n_frames=PROCESS_EVERY_N_FRAMES,
-	)
+	# Print model configuration
+	print("=" * 70)
+	print("YOLO Models Configuration")
+	print("=" * 70)
+	print(f"Ball Detection Model:   {ModelConfig.BALL_MODEL}")
+	print(f"Ball Confidence:        {ModelConfig.BALL_CONFIDENCE}")
+	print(f"Players Detection Model: {ModelConfig.PLAYERS_MODEL}")
+	print(f"Players Confidence:     {ModelConfig.PLAYERS_CONFIDENCE}")
+	print(f"Pose Estimation Model:  {ModelConfig.POSE_MODEL}")
+	print(f"Pose Confidence:        {ModelConfig.POSE_CONFIDENCE}")
+	print(f"Process Every N Frames: {ModelConfig.PROCESS_EVERY_N_FRAMES}")
+	print("=" * 70)
+	print()
+
+	# Initialize pipeline with default configuration from ModelConfig
+	pipeline = PenaltyPipeline()
 
 	result = pipeline.process_video(
 		input_video=input_video,

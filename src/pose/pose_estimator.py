@@ -4,6 +4,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Optional
 from ultralytics import YOLO
+from ..models import ModelConfig
 
 
 # COCO pose keypoint indices (YOLOv8 pose output has 17 keypoints)
@@ -38,14 +39,24 @@ class PoseEstimation:
 class PoseEstimator:
     """Estimate human pose using YOLO pose model."""
     
-    def __init__(self, model_path: str = "yolov8s-pose.pt", confidence: float = 0.25):
+    def __init__(
+        self,
+        model_path: str | None = None,
+        confidence: float | None = None,
+    ):
         """Initialize pose estimator.
         
         Args:
-            model_path: Path to YOLO pose model weights.
-            confidence: Confidence threshold for detections (default 0.25 - permissive).
+            model_path: Path to YOLO pose model weights. If None, uses ModelConfig.POSE_MODEL.
+            confidence: Confidence threshold. If None, uses ModelConfig.POSE_CONFIDENCE.
         """
+        if model_path is None:
+            model_path = ModelConfig.get_pose_model_path()
+        if confidence is None:
+            confidence = ModelConfig.POSE_CONFIDENCE
+            
         self.model = YOLO(model_path)
+        self.model_path = model_path
         self.confidence = confidence
     
     def estimate(self, frame: np.ndarray, bbox_xyxy: tuple[int, int, int, int]) -> PoseEstimation | None:
@@ -58,8 +69,21 @@ class PoseEstimator:
         Returns:
             PoseEstimation object or None if pose cannot be estimated.
         """
+        frame_h, frame_w = frame.shape[:2]
+        x1, y1, x2, y2 = bbox_xyxy
+        pad_x = int((x2 - x1) * 0.25)
+        pad_y = int((y2 - y1) * 0.35)
+        crop_x1 = max(0, x1 - pad_x)
+        crop_y1 = max(0, y1 - pad_y)
+        crop_x2 = min(frame_w, x2 + pad_x)
+        crop_y2 = min(frame_h, y2 + pad_y)
+        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+
+        if crop.size == 0:
+            return None
+
         results = self.model.predict(
-            frame,
+            crop,
             conf=self.confidence,
             verbose=False
         )
@@ -73,11 +97,14 @@ class PoseEstimator:
         if len(keypoints_xy) == 0:
             return None
         
-        match_index = self._best_iou_match(bbox_xyxy, results[0].boxes.xyxy.cpu().numpy())
+        crop_bbox = np.array([[x1 - crop_x1, y1 - crop_y1, x2 - crop_x1, y2 - crop_y1]], dtype=np.float32)
+        match_index = self._best_iou_match(tuple(crop_bbox[0].astype(int)), results[0].boxes.xyxy.cpu().numpy())
         if match_index is None:
             return None
 
-        raw_xy = keypoints_xy[match_index]
+        raw_xy = keypoints_xy[match_index].copy()
+        raw_xy[:, 0] += crop_x1
+        raw_xy[:, 1] += crop_y1
         raw_conf = keypoints_conf[match_index] if keypoints_conf is not None else np.ones(17)
         
         # Extract named keypoints from COCO indices
