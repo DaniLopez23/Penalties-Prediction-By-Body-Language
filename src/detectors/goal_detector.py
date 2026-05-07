@@ -251,12 +251,12 @@ class GoalDetector:
         side_padding: int = 24,
         top_padding: int = 18,
         mask_color: int = 0,
+        blur_kernel: int = 35,
     ) -> np.ndarray:
-        """Mask (darken to black) everything except the goal corridor and the area below it.
+        """Blur everything except the goal corridor and the area below it.
         
-        Much faster than GaussianBlur: uses binary masking instead.
         The preserved window keeps the goal mouth, the goalkeeper area, and the
-        lower field intact while darkening the top clutter and the sides that can
+        lower field intact while blurring the top clutter and the sides that can
         confuse the detectors.
         
         Args:
@@ -264,7 +264,8 @@ class GoalDetector:
             goal: GoalDetection object (if None, returns original frame).
             side_padding: Horizontal padding around goal (pixels).
             top_padding: Vertical padding above goal (pixels).
-            mask_color: Color to apply outside zone (0=black, 255=white).
+            mask_color: Fallback color when blur_kernel is 0.
+            blur_kernel: Odd Gaussian kernel size. If <= 0, use mask_color.
             
         Returns:
             Frame with masked areas or original frame if goal is None.
@@ -279,18 +280,59 @@ class GoalDetector:
         keep_x2 = min(frame_w, x2 + side_padding)
         keep_y1 = max(0, y1 - top_padding)
 
-        masked = frame.copy()
-        
-        # Mask top area (above goal + padding)
-        if keep_y1 > 0:
-            masked[:keep_y1, :] = mask_color
-        
-        # Mask left side (before goal - padding)
-        if keep_x1 > 0:
-            masked[keep_y1:, :keep_x1] = mask_color
-        
-        # Mask right side (after goal + padding)
-        if keep_x2 < frame_w:
-            masked[keep_y1:, keep_x2:] = mask_color
-        
+        keep_mask = np.zeros((frame_h, frame_w), dtype=bool)
+        keep_mask[keep_y1:, keep_x1:keep_x2] = True
+        return self._apply_outside_mask(frame, keep_mask, mask_color, blur_kernel)
+
+    def mask_for_player_detection(
+        self,
+        frame: np.ndarray,
+        goal: GoalDetection | None,
+        side_padding: int = 180,
+        top_padding: int = 110,
+        keep_field_below_goal: int = 80,
+        mask_color: int = 0,
+        blur_kernel: int = 35,
+    ) -> np.ndarray:
+        """Blur crowd clutter while preserving a jumping goalkeeper and shooter.
+
+        Unlike mask_outside_goal_area, this keeps the lower field at full width.
+        That matters for the shooter, whose run-up can drift outside the goal
+        corridor in the behind-the-kicker camera view. Above and around the
+        goal, only a padded goal corridor is kept so the player detector sees
+        the goalkeeper's hands/head above the crossbar without ingesting the
+        whole stand.
+        """
+        if goal is None:
+            return frame.copy()
+
+        frame_h, frame_w = frame.shape[:2]
+        x1, y1, x2, y2 = goal.bbox_xyxy
+
+        keep_x1 = max(0, x1 - side_padding)
+        keep_x2 = min(frame_w, x2 + side_padding)
+        keep_y1 = max(0, y1 - top_padding)
+        field_y = min(frame_h, y2 + keep_field_below_goal)
+
+        keep_mask = np.zeros((frame_h, frame_w), dtype=bool)
+        keep_mask[keep_y1:field_y, keep_x1:keep_x2] = True
+        keep_mask[field_y:, :] = True
+
+        return self._apply_outside_mask(frame, keep_mask, mask_color, blur_kernel)
+
+    @staticmethod
+    def _apply_outside_mask(
+        frame: np.ndarray,
+        keep_mask: np.ndarray,
+        mask_color: int = 0,
+        blur_kernel: int = 35,
+    ) -> np.ndarray:
+        if blur_kernel and blur_kernel > 0:
+            kernel = blur_kernel if blur_kernel % 2 == 1 else blur_kernel + 1
+            blurred = cv2.GaussianBlur(frame, (kernel, kernel), 0)
+            masked = blurred.copy()
+        else:
+            masked = np.full_like(frame, mask_color)
+
+        masked[keep_mask] = frame[keep_mask]
         return masked

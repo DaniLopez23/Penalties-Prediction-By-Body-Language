@@ -1,7 +1,8 @@
 """Ball detection + tracking using YOLO with physics-aware re-acquisition."""
 
 import numpy as np
-from dataclasses import dataclass, field
+import cv2
+from dataclasses import dataclass
 from ultralytics import YOLO
 from ..models import ModelConfig
 
@@ -11,7 +12,7 @@ class BallDetection:
     bbox_xyxy: tuple[int, int, int, int]
     confidence: float
     center: tuple[float, float]
-    track_id: int | None = None
+    predicted: bool = False
 
     @property
     def area(self) -> float:
@@ -42,39 +43,39 @@ class BallDetector:
     """
 
     # ── Motion / tracking (60fps-calibrated) ─────────────────────────────────
-    BASE_MAX_DIST           = 280   # was 200
-    MAX_DIST_PER_MISS       = 30    # was 40
-    ROI_RADIUS              = 320   # was 260
-    MAX_MISSED_PRE_SHOT     = 12    # generous before kick
-    MAX_MISSED_POST_SHOT    = 5     # strict after ball is moving fast
-    MIN_SPEED_FOR_DIR_FILTER = 14.0 # was 8.0 — scaled for 60fps px/frame
-    VELOCITY_EMA_ALPHA      = 0.20  # was 0.30
+    BASE_MAX_DIST = ModelConfig.BALL_BASE_MAX_DIST
+    MAX_DIST_PER_MISS = ModelConfig.BALL_MAX_DIST_PER_MISS
+    ROI_RADIUS = ModelConfig.BALL_ROI_RADIUS
+    MAX_MISSED_PRE_SHOT = ModelConfig.BALL_MAX_MISSED_PRE_SHOT
+    MAX_MISSED_POST_SHOT = ModelConfig.BALL_MAX_MISSED_POST_SHOT
+    MIN_SPEED_FOR_DIR_FILTER = ModelConfig.BALL_MIN_SPEED_FOR_DIR_FILTER
+    VELOCITY_EMA_ALPHA = ModelConfig.BALL_VELOCITY_EMA_ALPHA
 
     # ── Ball size ─────────────────────────────────────────────────────────────
-    MIN_AREA       = 20     # was 12
-    MAX_AREA       = 8000   # was 9000
-    AREA_RATIO_MIN = 0.55   # was 0.45
-    AREA_RATIO_MAX = 1.90   # was 2.4
+    MIN_AREA = ModelConfig.BALL_MIN_AREA
+    MAX_AREA = ModelConfig.BALL_MAX_AREA
+    AREA_RATIO_MIN = ModelConfig.BALL_AREA_RATIO_MIN
+    AREA_RATIO_MAX = ModelConfig.BALL_AREA_RATIO_MAX
 
     # ── Shape ─────────────────────────────────────────────────────────────────
-    MAX_ASPECT_RATIO = 1.6  # was 1.8
+    MAX_ASPECT_RATIO = ModelConfig.BALL_MAX_ASPECT_RATIO
 
     # ── Near-goal zone (tightened) ────────────────────────────────────────────
-    NEAR_GOAL_Y_FRACTION = 0.45
-    NEAR_GOAL_MAX_AREA   = 4000    # was 5500
-    NEAR_GOAL_MIN_CONF   = 0.35    # was 0.25
-    NEAR_GOAL_MAX_ASPECT = 1.30    # was 1.45
+    NEAR_GOAL_Y_FRACTION = ModelConfig.BALL_NEAR_GOAL_Y_FRACTION
+    NEAR_GOAL_MAX_AREA = ModelConfig.BALL_NEAR_GOAL_MAX_AREA
+    NEAR_GOAL_MIN_CONF = ModelConfig.BALL_NEAR_GOAL_MIN_CONF
+    NEAR_GOAL_MAX_ASPECT = ModelConfig.BALL_NEAR_GOAL_MAX_ASPECT
 
     # ── Re-acquisition confirmation ───────────────────────────────────────────
-    REACQ_MIN_MISSED       = 3     # gaps shorter than this: trust immediately
-    REACQ_CONFIRM_FRAMES   = 2     # frames needed to confirm re-acquisition
-    REACQ_MAX_DRIFT        = 60    # px — candidates must be spatially consistent
+    REACQ_MIN_MISSED = ModelConfig.BALL_REACQ_MIN_MISSED
+    REACQ_CONFIRM_FRAMES = ModelConfig.BALL_REACQ_CONFIRM_FRAMES
+    REACQ_MAX_DRIFT = ModelConfig.BALL_REACQ_MAX_DRIFT
 
     # ── Physics projection ────────────────────────────────────────────────────
-    DECEL_PER_MISS         = 0.92  # speed multiplier per missed frame (air drag)
-    ELLIPSE_R_ALONG_BASE   = 60    # px base uncertainty along velocity axis
-    ELLIPSE_R_PERP_BASE    = 40    # px base uncertainty perpendicular
-    ELLIPSE_R_PERP_GROW    = 8     # px per missed frame (perpendicular uncertainty)
+    DECEL_PER_MISS = ModelConfig.BALL_DECEL_PER_MISS
+    ELLIPSE_R_ALONG_BASE = ModelConfig.BALL_ELLIPSE_R_ALONG_BASE
+    ELLIPSE_R_PERP_BASE = ModelConfig.BALL_ELLIPSE_R_PERP_BASE
+    ELLIPSE_R_PERP_GROW = ModelConfig.BALL_ELLIPSE_R_PERP_GROW
 
     def __init__(
         self,
@@ -89,9 +90,11 @@ class BallDetector:
         self.model      = YOLO(model_path)
         self.model_path = model_path
         self.confidence = confidence
+        self.imgsz      = ModelConfig.BALL_IMGSZ
 
         self._goal_bbox: tuple[int, int, int, int] | None = None
         self._shot_detected: bool = False
+        self._wide_reacq_active: bool = False
 
         self.reset()
 
@@ -99,12 +102,14 @@ class BallDetector:
 
     def reset(self) -> None:
         self.last_position:  tuple[float, float] | None = None
+        self.last_measured_position: tuple[float, float] | None = None
         self.velocity:       tuple[float, float] | None = None
         self.last_detection: BallDetection | None       = None
         self.missed_frames:  int                        = 0
-        self.last_track_id:  int | None                 = None
         self._area_history:  list[float]                = []
         self._candidate_buffer: list[BallDetection]     = []
+        self._kalman = self._create_kalman_filter()
+        self._kalman_ready: bool = False
 
     def set_goal_bbox(self, goal_bbox: tuple | None) -> None:
         self._goal_bbox = goal_bbox
@@ -113,64 +118,96 @@ class BallDetector:
         """Pipeline notifies us once the shot is confirmed."""
         self._shot_detected = detected
 
-    def detect(self, frame: np.ndarray) -> BallDetection | None:
-        h, w = frame.shape[:2]
+    def track_without_detection(self) -> BallDetection | None:
+        """Propagate the ball state with OpenCV KalmanFilter.
 
-        results = self.model.track(
-            frame,
-            imgsz=1280,
-            persist=True,
-            tracker="bytetrack.yaml",
-            conf=self.confidence,
-            classes=[32],
-            verbose=False,
+        This is used on frames between detector refreshes. It does not increase
+        missed_frames because no detector attempt has failed.
+        """
+        if self.last_detection is None or self.last_position is None:
+            return None
+
+        pred = self._kalman_predict()
+        if pred is None:
+            pred = self._predict() or self.last_position
+        px, py = float(pred[0]), float(pred[1])
+        self.last_position = (px, py)
+
+        x1, y1, x2, y2 = self.last_detection.bbox_xyxy
+        bw = max(2, x2 - x1)
+        bh = max(2, y2 - y1)
+        return BallDetection(
+            bbox_xyxy=(
+                int(px - bw / 2), int(py - bh / 2),
+                int(px + bw / 2), int(py + bh / 2),
+            ),
+            confidence=max(0.05, self.last_detection.confidence * 0.95),
+            center=(px, py),
+            predicted=True,
         )
+
+    def detect(self, frame: np.ndarray) -> BallDetection | None:
+        h = frame.shape[0]
+        self._wide_reacq_active = False
+
+        inference_frame, offset = self._build_inference_roi(frame)
+        if inference_frame.size == 0:
+            return self._handle_no_detection()
+
+        predict_kwargs = {
+            "imgsz": self.imgsz,
+            "conf": self.confidence,
+            "classes": [ModelConfig.BALL_CLASS_ID],
+            "verbose": False,
+        }
+        if ModelConfig.BALL_DEVICE is not None:
+            predict_kwargs["device"] = ModelConfig.BALL_DEVICE
+        if ModelConfig.BALL_HALF:
+            predict_kwargs["half"] = True
+
+        results = self.model.predict(inference_frame, **predict_kwargs)
 
         if not results or len(results[0].boxes) == 0:
             return self._handle_no_detection()
 
         boxes = results[0].boxes
-        candidates: list[tuple[BallDetection, int | None]] = []
+        candidates: list[BallDetection] = []
 
         for i in range(len(boxes)):
             coords   = boxes.xyxy[i].cpu().numpy().astype(int)
+            ox, oy = offset
             x1, y1, x2, y2 = coords
+            x1 += ox
+            x2 += ox
+            y1 += oy
+            y2 += oy
             conf     = float(boxes.conf[i])
             center   = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-            track_id = int(boxes.id[i].item()) if boxes.id is not None else None
-
-            det = BallDetection((x1, y1, x2, y2), conf, center, track_id)
+            det = BallDetection((x1, y1, x2, y2), conf, center)
             if self._is_valid(det, frame.shape):
-                candidates.append((det, track_id))
+                candidates.append(det)
 
         if not candidates:
             return self._handle_no_detection()
 
-        # ── 1. Same track_id as last frame → fast-path ─────────────────────
-        if self.last_track_id is not None:
-            for det, tid in candidates:
-                if tid == self.last_track_id and self._area_consistent(det):
-                    self._candidate_buffer.clear()
-                    self._update_state(det)
-                    return det
-
+        # 1. Predict the next plausible center from real measurements.
         pred = self._predict()
 
         # ── 2. Physics ellipse filter ──────────────────────────────────────
         ellipse = self._search_ellipse()
         if ellipse is not None:
             in_ellipse = [
-                d for d, _ in candidates
+                d for d in candidates
                 if self._in_ellipse(d.center, ellipse)
             ]
             if in_ellipse:
-                candidates = [(d, t) for d, t in candidates if d in in_ellipse]
+                candidates = [d for d in candidates if d in in_ellipse]
 
         # ── 3. Standard distance + area gate ──────────────────────────────
         max_dist = self._adaptive_max_dist()
         valid: list[BallDetection] = []
-        for det, _ in candidates:
-            if pred is None:
+        for det in candidates:
+            if pred is None or self._wide_reacq_active:
                 valid.append(det)
             else:
                 dist = self._distance(det.center, pred)
@@ -181,7 +218,7 @@ class BallDetector:
         if not valid:
             if pred is not None:
                 relaxed = [
-                    d for d, _ in candidates
+                    d for d in candidates
                     if self._distance(d.center, pred) < max_dist * 1.6
                 ]
                 valid = relaxed if relaxed else []
@@ -232,6 +269,8 @@ class BallDetector:
     def _in_roi(self, center: tuple) -> bool:
         if self.last_position is None:
             return True
+        if self._wide_reacq_active:
+            return True
         dx = abs(center[0] - self.last_position[0])
         dy = abs(center[1] - self.last_position[1])
         r  = max(self.ROI_RADIUS, self._adaptive_max_dist() * 1.15)
@@ -269,6 +308,10 @@ class BallDetector:
 
     def _confirm_reacquisition(self, candidate: BallDetection) -> BallDetection | None:
         """Require REACQ_CONFIRM_FRAMES consistent detections before committing."""
+        if self.REACQ_CONFIRM_FRAMES <= 1 or self._wide_reacq_active:
+            self._candidate_buffer.clear()
+            return candidate
+
         self._candidate_buffer.append(candidate)
         if len(self._candidate_buffer) < self.REACQ_CONFIRM_FRAMES:
             return None  # not enough evidence yet
@@ -300,9 +343,9 @@ class BallDetector:
 
     def _update_state(self, detection: BallDetection) -> None:
         new_pos = detection.center
-        if self.last_position is not None:
-            dvx = new_pos[0] - self.last_position[0]
-            dvy = new_pos[1] - self.last_position[1]
+        if self.last_measured_position is not None:
+            dvx = new_pos[0] - self.last_measured_position[0]
+            dvy = new_pos[1] - self.last_measured_position[1]
             if self.velocity is None:
                 self.velocity = (dvx, dvy)
             else:
@@ -313,9 +356,10 @@ class BallDetector:
                 )
 
         self.last_position  = new_pos
+        self.last_measured_position = new_pos
         self.last_detection = detection
-        self.last_track_id  = detection.track_id
         self.missed_frames  = 0
+        self._kalman_correct(new_pos)
 
         self._area_history.append(detection.area)
         if len(self._area_history) > 8:
@@ -332,7 +376,7 @@ class BallDetector:
             and self.missed_frames < max_miss
         ):
             self.missed_frames += 1
-            pred = self._predict()
+            pred = self._kalman_predict() or self._predict()
             self.last_position = pred
             if self.last_detection is not None:
                 x1, y1, x2, y2 = self.last_detection.bbox_xyxy
@@ -346,8 +390,9 @@ class BallDetector:
                     ),
                     confidence=max(0.05, self.last_detection.confidence * 0.7),
                     center=(px, py),
+                    predicted=True,
                 )
-            return BallDetection(bbox_xyxy=(0,0,0,0), confidence=0.0, center=pred)
+            return BallDetection(bbox_xyxy=(0,0,0,0), confidence=0.0, center=pred, predicted=True)
 
         self.missed_frames += 1
         if self.missed_frames > max_miss:
@@ -387,6 +432,8 @@ class BallDetector:
 
     def _continuity_penalty(self, det: BallDetection) -> float:
         """Heavy penalty for candidates that imply impossible jumps after a miss."""
+        if self._wide_reacq_active:
+            return 0.0
         if self.velocity is None or self.last_position is None or self.missed_frames == 0:
             return 0.0
         n = self.missed_frames
@@ -439,6 +486,8 @@ class BallDetector:
     # ── Area consistency ──────────────────────────────────────────────────────
 
     def _area_consistent(self, det: BallDetection) -> bool:
+        if self._wide_reacq_active:
+            return True
         if self.last_detection is None:
             return True
         last_area = max(1.0, float(self.last_detection.area))
@@ -456,6 +505,104 @@ class BallDetector:
             speed = float(np.sqrt(self.velocity[0] ** 2 + self.velocity[1] ** 2))
         dist = self.BASE_MAX_DIST + 0.9 * speed + self.missed_frames * self.MAX_DIST_PER_MISS
         return min(500.0, dist)
+
+    def _build_inference_roi(self, frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+        """Crop a search window before inference to reduce YOLO work.
+
+        Full-frame ball detection at high image size is expensive. Once the
+        ball has been seen, the physical tracker gives a compact ROI. Before
+        that, the stabilized goal provides a broad penalty corridor.
+        """
+        frame_h, frame_w = frame.shape[:2]
+
+        if self.last_position is not None:
+            speed = self._speed()
+            if self._goal_bbox is not None and (
+                self.missed_frames >= 2
+                or self._shot_detected
+                or speed < self.MIN_SPEED_FOR_DIR_FILTER
+            ):
+                return self._build_goal_corridor_roi(frame)
+
+            cx, cy = self._predict() if self.velocity is not None else self.last_position
+            radius = int(max(self.ROI_RADIUS, self._adaptive_max_dist() * 1.35))
+            x1 = max(0, int(cx - radius))
+            y1 = max(0, int(cy - radius))
+            x2 = min(frame_w, int(cx + radius))
+            y2 = min(frame_h, int(cy + radius))
+            return frame[y1:y2, x1:x2], (x1, y1)
+
+        if self._goal_bbox is not None:
+            gx1, gy1, gx2, gy2 = self._goal_bbox
+            goal_w = max(1, gx2 - gx1)
+            goal_h = max(1, gy2 - gy1)
+            x1 = max(0, int(gx1 - goal_w * 0.60))
+            x2 = min(frame_w, int(gx2 + goal_w * 0.60))
+            y1 = max(0, int(gy1 - goal_h * 0.50))
+            y2 = frame_h
+            return frame[y1:y2, x1:x2], (x1, y1)
+
+        return frame, (0, 0)
+
+    def _build_goal_corridor_roi(self, frame: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+        frame_h, frame_w = frame.shape[:2]
+        gx1, gy1, gx2, gy2 = self._goal_bbox
+        goal_w = max(1, gx2 - gx1)
+        goal_h = max(1, gy2 - gy1)
+
+        px, _ = (
+            self.last_position
+            if self.last_position is not None
+            else ((gx1 + gx2) / 2.0, frame_h * 0.7)
+        )
+        x1 = min(gx1, int(px)) - int(goal_w * 0.75)
+        x2 = max(gx2, int(px)) + int(goal_w * 0.75)
+        y1 = max(0, gy1 - int(goal_h * 0.65))
+        y2 = frame_h
+
+        self._wide_reacq_active = True
+        x1 = max(0, x1)
+        x2 = min(frame_w, x2)
+        return frame[y1:y2, x1:x2], (x1, y1)
+
+    def _speed(self) -> float:
+        if self.velocity is None:
+            return 0.0
+        return float(np.sqrt(self.velocity[0] ** 2 + self.velocity[1] ** 2))
+
+    @staticmethod
+    def _create_kalman_filter() -> cv2.KalmanFilter:
+        kalman = cv2.KalmanFilter(4, 2)
+        kalman.transitionMatrix = np.array(
+            [[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=np.float32,
+        )
+        kalman.measurementMatrix = np.array(
+            [[1, 0, 0, 0], [0, 1, 0, 0]],
+            dtype=np.float32,
+        )
+        kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+        kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.8
+        kalman.errorCovPost = np.eye(4, dtype=np.float32)
+        return kalman
+
+    def _kalman_correct(self, position: tuple[float, float]) -> None:
+        x, y = position
+        if not self._kalman_ready:
+            self._kalman.statePost = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+            self._kalman_ready = True
+            return
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        self._kalman.correct(measurement)
+        if self.velocity is not None:
+            self._kalman.statePost[2, 0] = np.float32(self.velocity[0])
+            self._kalman.statePost[3, 0] = np.float32(self.velocity[1])
+
+    def _kalman_predict(self) -> tuple[float, float] | None:
+        if not self._kalman_ready:
+            return None
+        prediction = self._kalman.predict()
+        return (float(prediction[0, 0]), float(prediction[1, 0]))
 
     def _distance(self, p1: tuple, p2: tuple) -> float:
         dx = p1[0] - p2[0]

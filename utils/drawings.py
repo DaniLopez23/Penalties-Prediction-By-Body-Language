@@ -107,6 +107,11 @@ def draw_metrics_text(frame: np.ndarray, metrics: Any, frame_idx: int) -> None:
             cv2.putText(frame, text, (10, y_offset), font, font_scale, color, thickness)
             y_offset += 30
 
+        if getattr(metrics, "shooter_body_angle", None) is not None:
+            text = f"Shooter Body: {metrics.shooter_body_angle:.1f} deg"
+            cv2.putText(frame, text, (10, y_offset), font, font_scale, color, thickness)
+            y_offset += 30
+
         if metrics.goalkeeper_movement:
             text = f"GK Movement: {metrics.goalkeeper_movement}"
             cv2.putText(frame, text, (10, y_offset), font, font_scale, color, thickness)
@@ -114,6 +119,11 @@ def draw_metrics_text(frame: np.ndarray, metrics: Any, frame_idx: int) -> None:
 
         if metrics.goalkeeper_body_angle is not None:
             text = f"GK Body Angle: {metrics.goalkeeper_body_angle:.1f} deg"
+            cv2.putText(frame, text, (10, y_offset), font, font_scale, color, thickness)
+            y_offset += 30
+
+        if getattr(metrics, "goalkeeper_shoulder_angle", None) is not None:
+            text = f"GK Shoulders: {metrics.goalkeeper_shoulder_angle:.1f} deg"
             cv2.putText(frame, text, (10, y_offset), font, font_scale, color, thickness)
             y_offset += 30
 

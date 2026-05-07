@@ -12,9 +12,11 @@ from .pose.angles import AngleCalculator
 class PenaltyMetrics:
     """Metrics computed for penalty kick analysis."""
     shooter_shoulder_angle: Optional[float] = None
+    shooter_body_angle: Optional[float] = None
     ball_trajectory: List[tuple[int, int]] = field(default_factory=list)
     shot_direction: Optional[str] = None
     goalkeeper_movement: Optional[str] = None
+    goalkeeper_shoulder_angle: Optional[float] = None
     goalkeeper_body_angle: Optional[float] = None
     goalkeeper_reaction_time_ms: Optional[float] = None
 
@@ -76,11 +78,13 @@ class MetricsCalculator:
         
         if shooter_pose:
             metrics.shooter_shoulder_angle = AngleCalculator.shoulder_angle(shooter_pose)
+            metrics.shooter_body_angle = AngleCalculator.torso_angle(shooter_pose)
         
         metrics.ball_trajectory = list(self.ball_trajectory)
         metrics.goalkeeper_movement = self._compute_movement_direction(self.goalkeeper_trajectory)
         
         if goalkeeper_pose:
+            metrics.goalkeeper_shoulder_angle = AngleCalculator.shoulder_angle(goalkeeper_pose)
             metrics.goalkeeper_body_angle = AngleCalculator.torso_angle(goalkeeper_pose)
 
         metrics.shot_direction = self._compute_movement_direction(self.ball_trajectory)
