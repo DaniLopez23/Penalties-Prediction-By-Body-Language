@@ -5,7 +5,7 @@
 **Goal:** Analyze penalty kick videos to extract and track multiple entities (goalkeeper, shooter, ball) with precise role assignment and state tracking.
 
 **Technologies:**
-- YOLOv8 (Object Detection & Pose Estimation)
+- YOLOv11 (Object Detection & Pose Estimation)
 - ByteTrack (Multi-object Tracking)
 - OpenCV (Video I/O & Visualization)
 - MediaPipe + Supervision (Pose analysis & utilities)
@@ -43,8 +43,9 @@ Output Video + Stats
 **Key Responsibilities:**
 - Initialize all detectors (ball, players, goal)
 - Process video frames sequentially
-- Manage frame skipping (`process_every_n_frames`)
-- Coordinate role assignment with occlusion recovery
+- Own the cadence for each expensive inference step; do not force every entity through YOLO on every frame
+- Manage frame skipping / refresh cadence (`process_every_n_frames`, goal refresh cadence, ball refresh cadence, player refresh cadence)
+- Coordinate role assignment with occlusion recovery and reuse the last confirmed state when detections are temporarily missing
 - Annotate frames with bounding boxes and labels
 - Export annotated video
 
@@ -63,6 +64,13 @@ if velocity > 18.0 and not _shot_detected:
     # Freeze role assignments
 ```
 
+**Pipeline Optimization Rules:**
+- Prefer detect -> track/propagate -> reacquire, not detect-every-frame.
+- Only refresh a detector when the cadence says so, when confidence collapses, or when the tracked state has been lost.
+- Keep a narrow reacquisition region around the last known state instead of reopening the full frame.
+- Treat role freezing, ghost tracking and Kalman/physics propagation as first-class parts of the pipeline, not as visualization-only helpers.
+- The pipeline must remain the place where refresh frequency, loss handling and fallback behavior are coordinated.
+
 ---
 
 ### 2. **BallDetector** (`src/detectors/ball_detector.py`)
@@ -79,6 +87,9 @@ if velocity > 18.0 and not _shot_detected:
   - Pre-shot: MAX_MISSED_PRE_SHOT = 12 (generous)
   - Post-shot: MAX_MISSED_POST_SHOT = 5 (strict)
 - **Velocity EMA:** α = 0.20 (smoother trajectory)
+
+**Operating Rule:**
+- Use the ball detector as a refresh/reacquisition step. Between refreshes, propagate the last state with tracking logic instead of calling full inference again.
 
 **Parameters (60fps-calibrated for 1080p):**
 - BASE_MAX_DIST = 280px
@@ -107,6 +118,9 @@ if velocity > 18.0 and not _shot_detected:
   - Normal: α_decay = 0.80
   - Post-shot: α_decay = 0.98 (slower decay to keep visible)
 
+**Operating Rule:**
+- The player pass should stay track-based and cadence-controlled. Re-run expensive pose/person inference only when a refresh is needed; otherwise keep the last confirmed roles alive through the ghost tracker and role assigner.
+
 **Occlusion Scenarios Handled:**
 - Goalkeeper jumping/diving (net occlusion)
 - Goalkeeper overlap with goal post
@@ -121,6 +135,10 @@ if velocity > 18.0 and not _shot_detected:
 - Goal bounding box estimation
 - Masking outside goal area for analysis frame
 - Crossbar region filtering (rejects detections in crowd area)
+
+**Masking Rule:**
+- Any blur or mask that should influence detection or tracking must be applied before the detector sees the frame. Visualization blur alone is not enough.
+- Keep a reusable preprocessing mask for detector inputs, separate from the final annotated output frame.
 
 ---
 

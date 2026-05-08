@@ -145,7 +145,7 @@ def extraer_clip(video_path, video_id, clip_index, inicio_min, inicio_seg, fin_m
             "-t", str(duracion_clip),
             "-map", "0:v:0",
             "-an",
-            "-vf", f"fps={TARGET_FPS}",
+            "-vf", f"fps={TARGET_FPS},unsharp=lx=3:ly=3:la=0.8:cx=3:cy=3:ca=0.4",
             "-c:v", VIDEO_CODEC,
             "-preset", ENCODE_PRESET,
             "-crf", str(CRF),
