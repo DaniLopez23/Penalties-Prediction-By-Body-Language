@@ -1,9 +1,8 @@
-"""YOLO ball detector with tracker-backed contextual scoring."""
+"""Ball detection and tracking using YOLO with physics-aware re-acquisition."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import hypot
 
 import numpy as np
 from ultralytics import YOLO
@@ -26,32 +25,29 @@ class BallDetection:
 
 
 class BallDetector:
-    """Detect the ball with YOLO and keep the most plausible tracker output."""
+    """60fps-calibrated YOLO ball detector with physics gates."""
 
     def __init__(self, model_path: str | None = None, confidence: float | None = None):
         self.model_path = model_path or ModelConfig.get_ball_model_path()
-        self.accept_confidence = (
-            confidence if confidence is not None else ModelConfig.BALL_ACCEPT_CONFIDENCE
-        )
+        self.confidence = confidence if confidence is not None else ModelConfig.BALL_CONFIDENCE
         self.model = YOLO(self.model_path)
+
         self._goal_bbox: tuple[int, int, int, int] | None = None
         self._shooter_bbox: tuple[int, int, int, int] | None = None
         self._shot_detected = False
-        self._max_forward_progress = 0.0
         self.last_reject_reason: str | None = None
         self.last_real_detection: BallDetection | None = None
         self.reset()
 
     def reset(self) -> None:
-        self.last_detection: BallDetection | None = None
-        self.last_real_detection: BallDetection | None = None
         self.last_position: tuple[float, float] | None = None
         self.velocity: tuple[float, float] | None = None
+        self.last_detection: BallDetection | None = None
+        self.last_real_detection: BallDetection | None = None
         self.last_track_id: int | None = None
         self.missed_frames = 0
-        self.last_reject_reason = None
-        if not self._shot_detected:
-            self._max_forward_progress = 0.0
+        self._area_history: list[float] = []
+        self._candidate_buffer: list[BallDetection] = []
 
     def set_goal_bbox(self, goal_bbox: tuple[int, int, int, int] | None) -> None:
         self._goal_bbox = goal_bbox
@@ -60,90 +56,27 @@ class BallDetector:
         self._shooter_bbox = shooter_bbox
 
     def set_shot_detected(self, detected: bool) -> None:
-        if detected and not self._shot_detected:
-            self._max_forward_progress = max(
-                self._max_forward_progress,
-                self._progress_for_center_without_frame(
-                    self.last_real_detection.center if self.last_real_detection is not None else None
-                ),
-            )
-        if not detected:
-            self._max_forward_progress = 0.0
         self._shot_detected = detected
 
     def detect(self, frame: np.ndarray) -> BallDetection | None:
-        track_kwargs = {
-            "imgsz": ModelConfig.BALL_IMGSZ,
-            "persist": True,
-            "tracker": ModelConfig.BALL_TRACKER,
-            "conf": ModelConfig.BALL_CANDIDATE_CONFIDENCE,
-            "classes": [ModelConfig.BALL_CLASS_ID],
-            "verbose": False,
-        }
-        if ModelConfig.BALL_DEVICE is not None:
-            track_kwargs["device"] = ModelConfig.BALL_DEVICE
-        if ModelConfig.BALL_HALF:
-            track_kwargs["half"] = True
-        results = self.model.track(frame, **track_kwargs)
-
-        detections = self._read_detections(results, frame.shape)
-        if not detections:
-            return self._handle_no_detection()
-
-        selected = self._select_detection(detections, frame.shape)
-        if selected is None:
-            return self._handle_no_detection()
-
-        self._update_state(selected)
-        return selected
-
-    def hold_last(self) -> BallDetection | None:
-        return self._make_prediction(include_next_step=True)
-
-    def track_without_detection(self) -> BallDetection | None:
-        return self.hold_last()
-
-    def increment_miss(self) -> None:
-        self.missed_frames += 1
-        if self.missed_frames > self._max_missed_frames():
-            self.reset()
-
-    def _make_prediction(self, include_next_step: bool) -> BallDetection | None:
-        if self.last_detection is None:
-            return None
-        if self._shot_detected:
-            if self.missed_frames >= ModelConfig.BALL_MAX_PREDICTED_HOLD_POST_SHOT:
-                return None
-            if self.velocity is None or self._speed() < ModelConfig.BALL_MIN_POST_SHOT_SPEED:
-                return None
-
-        center = self._predict_center(include_next_step=include_next_step)
-        if center is None:
-            center = self.last_detection.center
-
-        x1, y1, x2, y2 = self.last_detection.bbox_xyxy
-        width = max(2, x2 - x1)
-        height = max(2, y2 - y1)
-        cx, cy = center
-        return BallDetection(
-            bbox_xyxy=(
-                int(round(cx - width / 2.0)),
-                int(round(cy - height / 2.0)),
-                int(round(cx + width / 2.0)),
-                int(round(cy + height / 2.0)),
-            ),
-            confidence=max(0.05, self.last_detection.confidence * 0.85),
-            center=(float(cx), float(cy)),
-            track_id=self.last_detection.track_id,
-            predicted=True,
+        h = frame.shape[0]
+        self.last_reject_reason = None
+        results = self.model.track(
+            frame,
+            imgsz=ModelConfig.BALL_IMGSZ,
+            persist=True,
+            tracker=ModelConfig.BALL_TRACKER,
+            conf=self.confidence,
+            classes=[ModelConfig.BALL_CLASS_ID],
+            verbose=False,
+            **self._device_kwargs(),
         )
 
-    def _read_detections(self, results, frame_shape: tuple[int, ...]) -> list[BallDetection]:
         if not results or len(results[0].boxes) == 0:
-            return []
+            return self._handle_no_detection()
 
-        detections: list[BallDetection] = []
         boxes = results[0].boxes
+        candidates: list[tuple[BallDetection, int | None]] = []
         for index in range(len(boxes)):
             x1, y1, x2, y2 = boxes.xyxy[index].cpu().numpy().astype(int)
             bbox = (int(x1), int(y1), int(x2), int(y2))
@@ -155,366 +88,402 @@ class BallDetector:
                 center=center,
                 track_id=track_id,
             )
-            if self._valid_geometry(detection, frame_shape):
-                detections.append(detection)
-        return detections
+            if self._is_valid(detection, frame.shape):
+                candidates.append((detection, track_id))
 
-    def _select_detection(
-        self,
-        detections: list[BallDetection],
-        frame_shape: tuple[int, ...],
-    ) -> BallDetection | None:
+        if not candidates:
+            return self._handle_no_detection()
+
+        if self.last_track_id is not None:
+            for detection, track_id in candidates:
+                if track_id == self.last_track_id and self._area_consistent(detection):
+                    self._candidate_buffer.clear()
+                    self._update_state(detection)
+                    return detection
+
+        pred = self._predict()
+        ellipse = self._search_ellipse()
+        if ellipse is not None:
+            in_ellipse = [
+                detection
+                for detection, _ in candidates
+                if self._in_ellipse(detection.center, ellipse)
+            ]
+            if in_ellipse:
+                candidates = [
+                    (detection, track_id)
+                    for detection, track_id in candidates
+                    if detection in in_ellipse
+                ]
+
+        max_dist = self._adaptive_max_dist()
         valid: list[BallDetection] = []
-        rejected_reasons: list[str] = []
-        for detection in detections:
-            reason = self._candidate_is_hard_rejected(detection, frame_shape)
-            if reason is None:
+        for detection, _ in candidates:
+            if pred is None:
                 valid.append(detection)
             else:
-                rejected_reasons.append(reason)
+                dist = self._distance(detection.center, pred)
+                if dist < max_dist and self._area_consistent(detection):
+                    valid.append(detection)
+
+        if not valid and pred is not None:
+            valid = [
+                detection
+                for detection, _ in candidates
+                if self._distance(detection.center, pred) < max_dist * ModelConfig.BALL_RELAXED_DIST_MULTIPLIER
+            ]
 
         if not valid:
-            self.last_reject_reason = rejected_reasons[0] if rejected_reasons else "no_valid_candidate"
-            return None
+            return self._handle_no_detection()
 
-        scored = [(self._score_detection(det, frame_shape), det) for det in valid]
-        score, detection = max(scored, key=lambda item: item[0])
-        if self._clearly_impossible_jump(detection) or score < self.accept_confidence:
-            self.last_reject_reason = "low_score"
-            return None
-        self.last_reject_reason = None
-        return detection
+        best = min(valid, key=lambda detection: self._score(detection, pred, h))
+        if self.missed_frames >= ModelConfig.BALL_REACQ_MIN_MISSED:
+            confirmed = self._confirm_reacquisition(best)
+            if confirmed is None:
+                self.last_reject_reason = "reacq_confirm"
+                return self._handle_no_detection()
+            best = confirmed
 
-    def _score_detection(self, detection: BallDetection, frame_shape: tuple[int, ...]) -> float:
-        score = detection.confidence
+        self._candidate_buffer.clear()
+        self._update_state(best)
+        return best
 
-        if detection.track_id is not None and detection.track_id == self.last_track_id:
-            score += 0.35
+    def hold_last(self) -> BallDetection | None:
+        return self._prediction_detection(increment_miss=False)
 
-        score += self._prediction_score(detection)
-        score += self._shape_score(detection)
-        score += self._candidate_zone_score(detection, frame_shape)
-        if self._shot_detected and self._has_forward_progress(detection, frame_shape):
-            score += 0.20
-        score -= self._jump_penalty(detection)
-        return score
+    def track_without_detection(self) -> BallDetection | None:
+        return self.hold_last()
 
-    def _valid_geometry(self, detection: BallDetection, frame_shape: tuple[int, ...]) -> bool:
-        h, w = frame_shape[:2]
-        x1, y1, x2, y2 = detection.bbox_xyxy
-        if x2 <= x1 or y2 <= y1:
+    def increment_miss(self) -> None:
+        self.missed_frames += 1
+        if self.missed_frames > self._max_missed_frames():
+            self.reset()
+
+    def _is_valid(self, detection: BallDetection, shape: tuple[int, ...]) -> bool:
+        hard_reject = self._hard_reject_reason(detection, shape)
+        if hard_reject is not None:
+            self.last_reject_reason = hard_reject
             return False
-        if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
-            return False
-
-        frame_area = max(1, w * h)
-        area_ratio = detection.area / frame_area
-        if not (ModelConfig.BALL_MIN_AREA_RATIO <= area_ratio <= ModelConfig.BALL_MAX_AREA_RATIO):
-            return False
-
-        width = max(1, x2 - x1)
-        height = max(1, y2 - y1)
-        aspect = width / height
-        return ModelConfig.BALL_MIN_ASPECT_RATIO <= aspect <= ModelConfig.BALL_MAX_ASPECT_RATIO
-
-    def _predict_center(self, include_next_step: bool = True) -> tuple[float, float] | None:
-        if self.last_position is None:
-            return None
-        if self.velocity is None:
-            return self.last_position
-        steps = self.missed_frames + (1 if include_next_step else 0)
-        steps = max(1, steps)
         return (
-            self.last_position[0] + self.velocity[0] * steps,
-            self.last_position[1] + self.velocity[1] * steps,
+            self._size_ok(detection)
+            and self._aspect_ratio_ok(detection, shape)
+            and self._position_ok(detection.center, shape)
+            and self._in_roi(detection.center)
         )
 
-    def _prediction_score(self, detection: BallDetection) -> float:
-        predicted = self._predict_center()
-        if predicted is None:
-            return 0.0
+    def _size_ok(self, detection: BallDetection) -> bool:
+        return ModelConfig.BALL_MIN_AREA < detection.area < ModelConfig.BALL_MAX_AREA
 
-        distance = self._distance(detection.center, predicted)
-        gate = (
-            ModelConfig.BALL_PREDICTION_GATE_BASE
-            + self.missed_frames * ModelConfig.BALL_PREDICTION_GATE_PER_MISS
-        )
-        if distance <= gate:
-            return 0.35 * (1.0 - distance / max(1.0, gate))
-        return -min(0.45, (distance - gate) / max(1.0, gate) * 0.35)
-
-    def _shape_score(self, detection: BallDetection) -> float:
+    def _aspect_ratio_ok(self, detection: BallDetection, shape: tuple[int, ...]) -> bool:
         x1, y1, x2, y2 = detection.bbox_xyxy
         width = max(1, x2 - x1)
         height = max(1, y2 - y1)
-        aspect = width / height
-        aspect_error = abs(np.log(aspect))
-        return max(-0.15, 0.10 - 0.12 * aspect_error)
+        ratio = max(width, height) / min(width, height)
+        if self._inside_goal_frame(detection):
+            return ratio <= ModelConfig.BALL_MAX_ASPECT_RATIO
+        if detection.center[1] < shape[0] * ModelConfig.BALL_NEAR_GOAL_Y_FRACTION:
+            return ratio <= ModelConfig.BALL_NEAR_GOAL_MAX_ASPECT
+        return ratio <= ModelConfig.BALL_MAX_ASPECT_RATIO
 
-    def _pre_shot_shooter_score(self, detection: BallDetection) -> float:
-        if self._shooter_bbox is None:
-            return 0.0
+    @staticmethod
+    def _position_ok(center: tuple[float, float], shape: tuple[int, ...]) -> bool:
+        x, y = center
+        h, w = shape[:2]
+        return 0.02 * w < x < 0.98 * w and 0.05 * h < y < 0.98 * h
 
-        sx1, sy1, sx2, sy2 = self._shooter_bbox
-        shooter_h = max(1, sy2 - sy1)
-        target = ((sx1 + sx2) / 2.0, sy2 - shooter_h * 0.08)
-        radius = max(80.0, shooter_h * ModelConfig.BALL_PRE_SHOT_SHOOTER_RADIUS_RATIO)
-        distance = self._distance(detection.center, target)
-        if distance <= radius:
-            return 0.30 * (1.0 - distance / radius)
-        if distance > radius * 2.0:
-            return -0.30
-        return -0.15 * ((distance - radius) / radius)
+    def _in_roi(self, center: tuple[float, float]) -> bool:
+        if self.last_position is None:
+            return True
+        if self._center_inside_goal_frame(center):
+            return True
+        dx = abs(center[0] - self.last_position[0])
+        dy = abs(center[1] - self.last_position[1])
+        radius = max(ModelConfig.BALL_ROI_RADIUS, self._adaptive_max_dist() * 1.15)
+        return dx < radius and dy < radius
 
-    def _goal_path_score(self, detection: BallDetection) -> float:
-        if self._shooter_bbox is None or self._goal_bbox is None:
-            return 0.0
+    def _hard_reject_reason(
+        self,
+        detection: BallDetection,
+        shape: tuple[int, ...],
+    ) -> str | None:
+        if self._is_behind_goal_noise(detection):
+            return "behind_goal"
+        if self._shot_detected and self._near_penalty_spot_after_shot(detection, shape):
+            return "penalty_spot"
+        return None
 
-        sx1, sy1, sx2, sy2 = self._shooter_bbox
+    def _is_behind_goal_noise(self, detection: BallDetection) -> bool:
+        if not ModelConfig.BALL_REJECT_BEHIND_GOAL or self._goal_bbox is None:
+            return False
+        if self._inside_goal_frame(detection):
+            return False
         gx1, gy1, gx2, gy2 = self._goal_bbox
-        start = np.array([(sx1 + sx2) / 2.0, float(sy2)])
-        end = np.array([(gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0])
-        point = np.array([detection.center[0], detection.center[1]])
-        segment = end - start
-        seg_len_sq = float(np.dot(segment, segment))
-        if seg_len_sq <= 1.0:
-            return 0.0
-
-        t = float(np.dot(point - start, segment) / seg_len_sq)
-        closest_t = min(1.15, max(-0.15, t))
-        closest = start + closest_t * segment
-        distance = float(np.linalg.norm(point - closest))
         goal_w = max(1, gx2 - gx1)
-        padding = max(100.0, goal_w * ModelConfig.BALL_GOAL_PATH_PADDING_RATIO)
+        goal_h = max(1, gy2 - gy1)
+        x, y = detection.center
+        top_margin = goal_h * ModelConfig.BALL_REJECT_ABOVE_GOAL_MARGIN_RATIO
+        lateral_margin = goal_w * ModelConfig.BALL_GOAL_LATERAL_MARGIN_RATIO
 
-        if -0.15 <= t <= 1.15 and distance <= padding:
-            return 0.35 * (1.0 - distance / padding)
-        if distance > padding * 2.0:
-            return -0.35
-        return -0.18 * ((distance - padding) / padding)
+        if y < gy1 - top_margin:
+            return True
+        if y < gy2 - top_margin and not (gx1 <= x <= gx2):
+            return True
+        if y < gy2 and not (gx1 - lateral_margin <= x <= gx2 + lateral_margin):
+            return True
+        return False
 
-    def _penalty_origin(self, frame_shape: tuple[int, ...]) -> tuple[float, float]:
+    def _inside_goal_frame(self, detection: BallDetection) -> bool:
+        return self._center_inside_goal_frame(detection.center)
+
+    def _center_inside_goal_frame(self, center: tuple[float, float]) -> bool:
+        if self._goal_bbox is None:
+            return False
+        gx1, gy1, gx2, gy2 = self._goal_bbox
+        goal_w = max(1, gx2 - gx1)
+        goal_h = max(1, gy2 - gy1)
+        x, y = center
+        x_pad = goal_w * 0.08
+        y_pad = goal_h * ModelConfig.BALL_REJECT_ABOVE_GOAL_MARGIN_RATIO
+        return gx1 - x_pad <= x <= gx2 + x_pad and gy1 - y_pad <= y <= gy2 + y_pad
+
+    def _near_penalty_spot_after_shot(
+        self,
+        detection: BallDetection,
+        shape: tuple[int, ...],
+    ) -> bool:
+        if self.velocity is None:
+            return False
+        speed = self._speed()
+        if speed < ModelConfig.BALL_MIN_POST_SHOT_SPEED:
+            return False
+        origin = self._penalty_origin(shape)
+        radius = self._frame_diag(shape) * ModelConfig.BALL_POST_SHOT_REJECT_PENALTY_SPOT_RADIUS_RATIO
+        return self._distance(detection.center, origin) <= radius
+
+    def _penalty_origin(self, shape: tuple[int, ...]) -> tuple[float, float]:
         if self._shooter_bbox is not None:
             sx1, sy1, sx2, sy2 = self._shooter_bbox
             shooter_h = max(1, sy2 - sy1)
             return ((sx1 + sx2) / 2.0, sy2 - shooter_h * 0.08)
         if self.last_real_detection is not None:
             return self.last_real_detection.center
-        h, w = frame_shape[:2]
+        h, w = shape[:2]
         return (w / 2.0, h * 0.78)
 
-    def _inside_goal_frame(self, candidate: BallDetection) -> bool:
-        if self._goal_bbox is None:
-            return False
-        gx1, gy1, gx2, gy2 = self._goal_bbox
-        goal_w = max(1, gx2 - gx1)
-        goal_h = max(1, gy2 - gy1)
-        x, y = candidate.center
-        x_pad = goal_w * 0.06
-        y_pad = goal_h * ModelConfig.BALL_REJECT_ABOVE_GOAL_MARGIN_RATIO
-        return gx1 - x_pad <= x <= gx2 + x_pad and gy1 - y_pad <= y <= gy2 + y_pad
+    def _search_ellipse(self) -> tuple[float, float, float, float, float] | None:
+        if self.last_position is None or self.velocity is None:
+            return None
+        n = max(1, self.missed_frames)
+        decay = ModelConfig.BALL_DECEL_PER_MISS ** n
+        vx, vy = self.velocity
+        cx = self.last_position[0] + vx * n * decay
+        cy = self.last_position[1] + vy * n * decay
+        speed = float(np.sqrt(vx**2 + vy**2))
+        r_along = ModelConfig.BALL_ELLIPSE_R_ALONG_BASE + speed * 0.4 * n
+        r_perp = ModelConfig.BALL_ELLIPSE_R_PERP_BASE + ModelConfig.BALL_ELLIPSE_R_PERP_GROW * n
+        angle = float(np.arctan2(vy, vx))
+        return (cx, cy, r_along, r_perp, angle)
 
-    def _is_behind_goal_noise(
-        self,
-        candidate: BallDetection,
-        frame_shape: tuple[int, ...],
+    @staticmethod
+    def _in_ellipse(
+        center: tuple[float, float],
+        ellipse: tuple[float, float, float, float, float],
     ) -> bool:
-        if not ModelConfig.BALL_REJECT_BEHIND_GOAL or self._goal_bbox is None:
-            return False
-        gx1, gy1, gx2, gy2 = self._goal_bbox
-        goal_w = max(1, gx2 - gx1)
-        goal_h = max(1, gy2 - gy1)
-        x, y = candidate.center
-        above_margin = goal_h * ModelConfig.BALL_REJECT_ABOVE_GOAL_MARGIN_RATIO
-        lateral_pad = goal_w * 0.10
+        cx, cy, r_along, r_perp, angle = ellipse
+        dx = center[0] - cx
+        dy = center[1] - cy
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        dx_r = dx * cos_a + dy * sin_a
+        dy_r = -dx * sin_a + dy * cos_a
+        val = (dx_r / max(1, r_along)) ** 2 + (dy_r / max(1, r_perp)) ** 2
+        return val <= 1.0
 
-        if y < gy1 - above_margin:
-            return True
-        if y < gy2 - above_margin and not self._inside_goal_frame(candidate):
-            return True
-        if y < gy2 and not (gx1 - lateral_pad <= x <= gx2 + lateral_pad):
-            return True
-        return False
-
-    def _has_forward_progress(
-        self,
-        candidate: BallDetection,
-        frame_shape: tuple[int, ...],
-    ) -> bool:
-        progress = self._progress_ratio(candidate, frame_shape)
-        return progress is not None and progress >= ModelConfig.BALL_POST_SHOT_MIN_PROGRESS_RATIO
-
-    def _is_backtracking(
-        self,
-        candidate: BallDetection,
-        frame_shape: tuple[int, ...],
-    ) -> bool:
-        if not self._shot_detected:
-            return False
-        progress = self._progress_ratio(candidate, frame_shape)
-        if progress is None:
-            return False
-        tolerance = ModelConfig.BALL_POST_SHOT_BACKTRACK_TOLERANCE_RATIO
-        return progress < self._max_forward_progress - tolerance
-
-    def _candidate_zone_score(
-        self,
-        candidate: BallDetection,
-        frame_shape: tuple[int, ...],
-    ) -> float:
-        if self._shot_detected:
-            predicted = self._predict_center()
-            if predicted is not None:
-                diag = self._frame_diag(frame_shape)
-                radius = max(80.0, diag * ModelConfig.BALL_SEARCH_RADIUS_POST_SHOT_RATIO)
-                distance = self._distance(candidate.center, predicted)
-                score = 0.35 * max(-1.0, 1.0 - distance / radius)
-            else:
-                score = 0.0
-            return score + self._goal_path_score(candidate)
-
-        if self._shooter_bbox is None and self.last_real_detection is None:
-            return 0.0
-        origin = self._penalty_origin(frame_shape)
-        radius = self._frame_diag(frame_shape) * ModelConfig.BALL_SEARCH_RADIUS_PRE_SHOT_RATIO
-        distance = self._distance(candidate.center, origin)
-        if distance <= radius:
-            return 0.45 * (1.0 - distance / max(1.0, radius))
-        return -0.60 * min(1.0, (distance - radius) / max(1.0, radius))
-
-    def _candidate_is_hard_rejected(
-        self,
-        candidate: BallDetection,
-        frame_shape: tuple[int, ...],
-    ) -> str | None:
-        if not self._shot_detected:
-            if self._shooter_bbox is None and self.last_real_detection is None:
-                return None
-            origin = self._penalty_origin(frame_shape)
-            radius = self._frame_diag(frame_shape) * ModelConfig.BALL_SEARCH_RADIUS_PRE_SHOT_RATIO
-            if self._distance(candidate.center, origin) > radius:
-                return "zone"
+    def _confirm_reacquisition(self, candidate: BallDetection) -> BallDetection | None:
+        self._candidate_buffer.append(candidate)
+        if len(self._candidate_buffer) < ModelConfig.BALL_REACQ_CONFIRM_FRAMES:
             return None
 
-        if self._is_behind_goal_noise(candidate, frame_shape):
-            return "behind_goal"
-        if self._is_backtracking(candidate, frame_shape):
-            return "backtracking"
-
-        origin = self._penalty_origin(frame_shape)
-        spot_radius = (
-            self._frame_diag(frame_shape)
-            * ModelConfig.BALL_POST_SHOT_REJECT_PENALTY_SPOT_RADIUS_RATIO
+        positions = [candidate.center for candidate in self._candidate_buffer]
+        max_drift = max(
+            self._distance(p1, p2)
+            for p1, p2 in zip(positions, positions[1:])
         )
-        progressed = self._max_forward_progress >= ModelConfig.BALL_POST_SHOT_MIN_PROGRESS_RATIO
-        if progressed and self._distance(candidate.center, origin) <= spot_radius:
-            return "penalty_spot"
-
-        predicted = self._predict_center()
-        if predicted is not None:
-            search_radius = max(
-                self._frame_diag(frame_shape) * ModelConfig.BALL_SEARCH_RADIUS_POST_SHOT_RATIO,
-                ModelConfig.BALL_PREDICTION_GATE_BASE
-                + self.missed_frames * ModelConfig.BALL_PREDICTION_GATE_PER_MISS,
-            )
-            if self._distance(candidate.center, predicted) > search_radius * 2.5:
-                return "zone"
+        buffer = self._candidate_buffer.copy()
+        self._candidate_buffer.clear()
+        if max_drift < ModelConfig.BALL_REACQ_MAX_DRIFT:
+            return buffer[-1]
         return None
 
-    def _progress_ratio(
-        self,
-        candidate: BallDetection,
-        frame_shape: tuple[int, ...],
-    ) -> float | None:
-        if self._goal_bbox is None:
-            return None
-        origin = np.array(self._penalty_origin(frame_shape), dtype=float)
-        gx1, gy1, gx2, gy2 = self._goal_bbox
-        goal = np.array([(gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0], dtype=float)
-        point = np.array(candidate.center, dtype=float)
-        segment = goal - origin
-        seg_len_sq = float(np.dot(segment, segment))
-        if seg_len_sq <= 1.0:
-            return None
-        return float(np.dot(point - origin, segment) / seg_len_sq)
-
-    def _progress_for_center_without_frame(self, center: tuple[float, float] | None) -> float:
-        if center is None or self._shooter_bbox is None or self._goal_bbox is None:
-            return 0.0
-        sx1, sy1, sx2, sy2 = self._shooter_bbox
-        shooter_h = max(1, sy2 - sy1)
-        origin = np.array([(sx1 + sx2) / 2.0, sy2 - shooter_h * 0.08], dtype=float)
-        gx1, gy1, gx2, gy2 = self._goal_bbox
-        goal = np.array([(gx1 + gx2) / 2.0, (gy1 + gy2) / 2.0], dtype=float)
-        point = np.array(center, dtype=float)
-        segment = goal - origin
-        seg_len_sq = float(np.dot(segment, segment))
-        if seg_len_sq <= 1.0:
-            return 0.0
-        return max(0.0, float(np.dot(point - origin, segment) / seg_len_sq))
-
-    def _jump_penalty(self, detection: BallDetection) -> float:
+    def _predict(self) -> tuple[float, float] | None:
         if self.last_position is None:
-            return 0.0
-
-        jump = self._distance(detection.center, self.last_position)
-        max_jump = (
-            ModelConfig.BALL_MAX_JUMP_POST_SHOT
-            if self._shot_detected
-            else ModelConfig.BALL_MAX_JUMP_PRE_SHOT
+            return None
+        if self.velocity is None:
+            return self.last_position
+        return (
+            self.last_position[0] + self.velocity[0],
+            self.last_position[1] + self.velocity[1],
         )
-        if jump <= max_jump:
-            return 0.0
-        if jump > max_jump * 2.5:
-            return 1.0
-        return (jump - max_jump) / max(1.0, max_jump) * 0.45
-
-    def _clearly_impossible_jump(self, detection: BallDetection) -> bool:
-        if self.last_position is None:
-            return False
-
-        max_jump = (
-            ModelConfig.BALL_MAX_JUMP_POST_SHOT
-            if self._shot_detected
-            else ModelConfig.BALL_MAX_JUMP_PRE_SHOT
-        )
-        return self._distance(detection.center, self.last_position) > max_jump * 3.0
 
     def _update_state(self, detection: BallDetection) -> None:
+        new_pos = detection.center
         if self.last_position is not None:
-            self.velocity = (
-                detection.center[0] - self.last_position[0],
-                detection.center[1] - self.last_position[1],
-            )
+            dvx = new_pos[0] - self.last_position[0]
+            dvy = new_pos[1] - self.last_position[1]
+            if self.velocity is None:
+                self.velocity = (dvx, dvy)
+            else:
+                alpha = ModelConfig.BALL_VELOCITY_EMA_ALPHA
+                self.velocity = (
+                    (1 - alpha) * self.velocity[0] + alpha * dvx,
+                    (1 - alpha) * self.velocity[1] + alpha * dvy,
+                )
 
+        self.last_position = new_pos
         self.last_detection = detection
         self.last_real_detection = detection
-        self.last_position = detection.center
         self.last_track_id = detection.track_id
         self.missed_frames = 0
-        if self._shot_detected:
-            self._max_forward_progress = max(
-                self._max_forward_progress,
-                self._progress_for_center_without_frame(detection.center),
-            )
+        self._area_history.append(detection.area)
+        if len(self._area_history) > 8:
+            self._area_history.pop(0)
 
     def _handle_no_detection(self) -> BallDetection | None:
-        self.increment_miss()
-        return self._make_prediction(include_next_step=False)
+        return self._prediction_detection(increment_miss=True)
 
-    @staticmethod
-    def _distance(p1: tuple[float, float], p2: tuple[float, float]) -> float:
-        return float(hypot(p1[0] - p2[0], p1[1] - p2[1]))
+    def _prediction_detection(self, increment_miss: bool) -> BallDetection | None:
+        if increment_miss:
+            self.missed_frames += 1
 
-    @staticmethod
-    def _frame_diag(frame_shape: tuple[int, ...]) -> float:
-        h, w = frame_shape[:2]
-        return float(hypot(w, h))
+        if self._shot_detected and self.missed_frames > ModelConfig.BALL_MAX_PREDICTED_HOLD_POST_SHOT:
+            return None
+        if (
+            self.last_position is None
+            or self.velocity is None
+            or self.last_detection is None
+            or self.missed_frames > self._max_missed_frames()
+        ):
+            if self.missed_frames > self._max_missed_frames():
+                self.reset()
+            return None
+        if self._shot_detected and self._speed() < ModelConfig.BALL_MIN_POST_SHOT_SPEED:
+            return None
 
-    def _speed(self) -> float:
-        if self.velocity is None:
+        pred = self._predict()
+        if pred is None:
+            return None
+
+        if increment_miss:
+            self.last_position = pred
+        x1, y1, x2, y2 = self.last_detection.bbox_xyxy
+        width = max(2, x2 - x1)
+        height = max(2, y2 - y1)
+        px, py = float(pred[0]), float(pred[1])
+        return BallDetection(
+            bbox_xyxy=(
+                int(px - width / 2),
+                int(py - height / 2),
+                int(px + width / 2),
+                int(py + height / 2),
+            ),
+            confidence=max(0.05, self.last_detection.confidence * 0.70),
+            center=(px, py),
+            track_id=self.last_track_id,
+            predicted=True,
+        )
+
+    def _score(self, detection: BallDetection, pred: tuple[float, float] | None, frame_h: int) -> float:
+        dist = 0.0
+        if pred is not None:
+            dx = detection.center[0] - pred[0]
+            dy = detection.center[1] - pred[1]
+            dist = float(np.sqrt(dx * dx + dy * dy))
+            if self.velocity is not None and dx * self.velocity[0] + dy * self.velocity[1] < 0:
+                dist *= 2.0
+
+        area_penalty = 0.0
+        if self.last_detection is not None:
+            area_penalty = abs(
+                float(np.log((detection.area + 1.0) / (self.last_detection.area + 1.0)))
+            )
+
+        return (
+            dist
+            + 45.0 * area_penalty
+            - 20.0 * detection.confidence
+            + self._direction_penalty(detection)
+            + self._goal_zone_penalty(detection, frame_h)
+            + self._continuity_penalty(detection)
+        )
+
+    def _continuity_penalty(self, detection: BallDetection) -> float:
+        if self.velocity is None or self.last_position is None or self.missed_frames == 0:
             return 0.0
-        return float(hypot(self.velocity[0], self.velocity[1]))
+        n = self.missed_frames
+        decay = ModelConfig.BALL_DECEL_PER_MISS ** n
+        pred_x = self.last_position[0] + self.velocity[0] * n * decay
+        pred_y = self.last_position[1] + self.velocity[1] * n * decay
+        dev = self._distance(detection.center, (pred_x, pred_y))
+        speed = self._speed()
+        allowed = speed * 0.5 * n + 40
+        if dev > allowed * 2:
+            return 300.0
+        if dev > allowed:
+            return 80.0
+        return 0.0
+
+    def _direction_penalty(self, detection: BallDetection) -> float:
+        if self.velocity is None or self.last_position is None:
+            return 0.0
+        speed = self._speed()
+        if speed < ModelConfig.BALL_MIN_SPEED_FOR_DIR_FILTER:
+            return 0.0
+        dx = detection.center[0] - self.last_position[0]
+        dy = detection.center[1] - self.last_position[1]
+        candidate_speed = float(np.sqrt(dx * dx + dy * dy))
+        if candidate_speed < 1e-3:
+            return 0.0
+        cos_theta = (self.velocity[0] * dx + self.velocity[1] * dy) / (speed * candidate_speed)
+        if cos_theta < -0.5:
+            return 120.0
+        if cos_theta < 0.0:
+            return 40.0
+        return 0.0
+
+    def _goal_zone_penalty(self, detection: BallDetection, frame_h: int) -> float:
+        if detection.center[1] >= frame_h * ModelConfig.BALL_NEAR_GOAL_Y_FRACTION:
+            return 0.0
+        if self._inside_goal_frame(detection):
+            return 0.0
+        penalty = 0.0
+        if detection.area > ModelConfig.BALL_NEAR_GOAL_MAX_AREA:
+            penalty += 80.0
+        if detection.confidence < ModelConfig.BALL_NEAR_GOAL_MIN_CONF:
+            penalty += 60.0
+        if self._goal_bbox is not None:
+            gx1, _, gx2, _ = self._goal_bbox
+            margin = (gx2 - gx1) * ModelConfig.BALL_GOAL_LATERAL_MARGIN_RATIO
+            if detection.center[0] < gx1 - margin or detection.center[0] > gx2 + margin:
+                penalty += 100.0
+        return penalty
+
+    def _area_consistent(self, detection: BallDetection) -> bool:
+        reference = self.last_real_detection or self.last_detection
+        if reference is None:
+            return True
+        last_area = max(1.0, float(reference.area))
+        ratio = float(detection.area) / last_area
+        max_growth = min(ModelConfig.BALL_AREA_RATIO_MAX + 0.10 * self.missed_frames, 2.2)
+        min_shrink = max(ModelConfig.BALL_AREA_RATIO_MIN - 0.02 * self.missed_frames, 0.4)
+        return min_shrink <= ratio <= max_growth
+
+    def _adaptive_max_dist(self) -> float:
+        speed = self._speed()
+        dist = (
+            ModelConfig.BALL_BASE_MAX_DIST
+            + 0.9 * speed
+            + self.missed_frames * ModelConfig.BALL_MAX_DIST_PER_MISS
+        )
+        return min(ModelConfig.BALL_MAX_ADAPTIVE_DIST, dist)
 
     def _max_missed_frames(self) -> int:
         return (
@@ -522,3 +491,28 @@ class BallDetector:
             if self._shot_detected
             else ModelConfig.BALL_MAX_MISSED_PRE_SHOT
         )
+
+    def _speed(self) -> float:
+        if self.velocity is None:
+            return 0.0
+        return float(np.sqrt(self.velocity[0] ** 2 + self.velocity[1] ** 2))
+
+    @staticmethod
+    def _frame_diag(shape: tuple[int, ...]) -> float:
+        h, w = shape[:2]
+        return float(np.sqrt(w * w + h * h))
+
+    @staticmethod
+    def _distance(p1: tuple[float, float], p2: tuple[float, float]) -> float:
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+        return float(np.sqrt(dx * dx + dy * dy))
+
+    @staticmethod
+    def _device_kwargs() -> dict:
+        kwargs = {}
+        if ModelConfig.BALL_DEVICE is not None:
+            kwargs["device"] = ModelConfig.BALL_DEVICE
+        if ModelConfig.BALL_HALF:
+            kwargs["half"] = True
+        return kwargs

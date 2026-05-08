@@ -48,7 +48,7 @@ class PenaltyPipeline:
     ):
         self.ball_detector = BallDetector(
             ball_model or ModelConfig.get_ball_model_path(),
-            ball_confidence if ball_confidence is not None else ModelConfig.BALL_ACCEPT_CONFIDENCE,
+            ball_confidence if ball_confidence is not None else ModelConfig.BALL_CONFIDENCE,
         )
         self.players_detector = PosePlayersDetector(
             players_model or ModelConfig.get_players_model_path(),
