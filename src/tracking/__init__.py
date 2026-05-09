@@ -1,1 +1,2 @@
-"""Lightweight tracking helpers."""
+"""Tracking and identity assignment."""
+

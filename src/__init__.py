@@ -1,1 +1,2 @@
-"""Penalty prediction by body language - Computer vision pipeline."""
+"""Penalty computer vision analysis package."""
+

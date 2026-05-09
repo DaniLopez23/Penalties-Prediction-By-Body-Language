@@ -1,1 +1,2 @@
-"""Ball, players, and goal detectors."""
+"""Object, pose and geometry detectors."""
+

@@ -1,3 +1,13 @@
 .venv
+*.pt
+data/output_videos/
+app/videos/
+data/debug_*.jpg
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
